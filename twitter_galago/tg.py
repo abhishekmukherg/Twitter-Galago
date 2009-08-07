@@ -1,24 +1,52 @@
 #!/usr/bin/env python
 
-import os
-import twitter
+import ConfigParser
+import getpass
 import keyring # This may have to be renamed after keyring's release
 import logging
+import os
+import pynotify
+import shutil
+import socket
+import tempfile
+import twitter
+import urllib2
 import xdg.BaseDirectory
-import getpass
-import ConfigParser
+import logging
+import time
+
+SOCKET_TIMEOUT = 10
 
 SVC_NAME = "twitter_galago"
 KEYRING_SVC = SVC_NAME
 XDG_RESOURCE = SVC_NAME
 
 CONFIG_FILENAME = "settings.ini"
+SLEEP_DELAY = 60 * 5
+
+
+logging.basicConfig(level=logging.DEBUG)
+LOG = logging.getLogger(__name__)
+
+socket.setdefaulttimeout(SOCKET_TIMEOUT)
+
+class GalagoException(Exception):
+    pass
+
+class NotAuthenticatedException(Exception):
+    pass
+
+if not pynotify.init("twitter_galago"):
+    raise GalagoException
+
 
 class TwitterGalago(object):
 
     def __init__(self):
+        LOG.info("Creating Twitter Galago")
         config_dir = xdg.BaseDirectory.load_first_config(XDG_RESOURCE)
         if config_dir is None:
+            LOG.info("Had to create config directory")
             config_dir = xdg.BaseDirectory.save_config_path(XDG_RESOURCE)
         self.config_filename = os.path.join(config_dir, CONFIG_FILENAME)
         self.config = ConfigParser.SafeConfigParser()
@@ -34,6 +62,10 @@ class TwitterGalago(object):
         user = self.username
         password = self.password
         self.api = twitter.Api(username=user, password=password)
+
+    def requires_auth(self):
+        if self.api is None:
+            raise NotAuthenticatedException
 
     @property
     def api(self):
@@ -54,24 +86,44 @@ class TwitterGalago(object):
         self.__api = None
 
     def get_new_messages(self):
-        pass
+        self.requires_auth()
+        statuses = self.api.GetFriendsTimeline(since_id=self._last_seen)
+        statuses.sort(key=lambda x:x.created_at_in_seconds)
+        LOG.info("Found %d new statuses" % len(statuses))
+        for status in statuses:
+            self.alert_status(status)
+        if len(statuses) > 0:
+            self._last_seen = statuses[-1].id
 
     def alert_status(self, status):
-        pass
+        summary = status.user.name
+        message = status.text
+        icon_url = status.user.profile_image_url
+
+        with tempfile.NamedTemporaryFile() as icon_file:
+            req = urllib2.urlopen(icon_url)
+            shutil.copyfileobj(req, icon_file)
+            icon_file.file.flush()
+            LOG.info("Saving temporary icon to %s" % icon_file.name)
+            n = pynotify.Notification(summary, message, icon_file.name)
+            n.show()
 
     @property
     def _last_seen(self):
         if self.__last_seen is None:
+            LOG.info("Last seen not set, getting from twitter")
+            self.requires_auth()
             try:
                 last_message = self.api.GetFriendsTimeline(count=1)[0]
             except IndexError:
-                self.__last_seen_id = None
+                self.__last_seen = None
             else:
-                self.__last_seen_id = last_message.GetId()
-        return self.__last_seen_id
+                self.__last_seen = last_message.id
+        return self.__last_seen
 
     @_last_seen.setter
     def _last_seen(self, val):
+        LOG.debug("Setting last seen to %d" % val)
         self.__last_seen = val
 
     @property
@@ -105,11 +157,17 @@ class TwitterGalago(object):
             self.config.write(f)
 
 def main():
-    x = TwitterGalago()
-    x.ensure_username_exists()
-    x.ensure_password_exists()
-    print x.username
-    print x.password
+    twit = TwitterGalago()
+    twit.ensure_username_exists()
+    twit.ensure_password_exists()
+    twit.auth()
+    try:
+        while True:
+            twit.get_new_messages()
+            time.sleep(SLEEP_DELAY)
+    except KeyboardInterrupt:
+        del twit.api
+
 
 if __name__ == "__main__":
     main()
